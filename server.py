@@ -2,88 +2,94 @@ import socket
 import ssl
 import threading
 import traceback
-import smbus
+from smbus2 import SMBus, i2c_msg
 
-# Initialize I2C (assuming device address 0x1)
-I2C_BUS = 1
-I2C_ADDRESS = 0x1
-i2c_bus = smbus.SMBus(I2C_BUS)
+class I2CServer:
+    def __init__(self, bus_number=1):
+        self.bus = SMBus(bus_number)
+    
+    def i2c_dump(self, address, length=16):
+        """Read block of data from I2C device"""
+        try:
+            msg = i2c_msg.read(address, length)
+            self.bus.i2c_rdwr(msg)
+            return list(msg)
+        except Exception as e:
+            return str(e)
+    
+    def i2c_read(self, address, register, length=1):
+        """Read from specific register"""
+        try:
+            return self.bus.read_i2c_block_data(address, register, length)
+        except Exception as e:
+            return str(e)
+    
+    def i2c_write(self, address, register, data):
+        """Write to specific register"""
+        try:
+            self.bus.write_i2c_block_data(address, register, data)
+            return True
+        except Exception as e:
+            return str(e)
 
-def handle_client(sslsock, client_address):
+def handle_client(sslsock, client_address, i2c_server):
     try:
         while True:
-            data = sslsock.recv(4096)
+            data = sslsock.recv(4096).decode().strip()
             if not data:
                 print(f"Client {client_address} disconnected.")
                 break
-
-            # Decode the received command
-            command = data.decode().strip().lower()
-            print(f"Received command from {client_address}: {command}")
-
-            # Process the command
-            response = process_command(command)
+            
+            print(f"Received command from {client_address}: {data}")
+            parts = data.split()
+            response = "ERROR: Invalid command"
+            
+            try:
+                if parts[0].lower() == "dump" and len(parts) == 2:
+                    address = int(parts[1], 16)
+                    result = i2c_server.i2c_dump(address)
+                    response = f"OK {result}" if isinstance(result, list) else f"ERROR {result}"
+                
+                elif parts[0].lower() == "read" and len(parts) >= 3:
+                    address = int(parts[1], 16)
+                    register = int(parts[2], 16)
+                    length = int(parts[3]) if len(parts) > 3 else 1
+                    result = i2c_server.i2c_read(address, register, length)
+                    response = f"OK {result}" if isinstance(result, list) else f"ERROR {result}"
+                
+                elif parts[0].lower() == "write" and len(parts) >= 4:
+                    address = int(parts[1], 16)
+                    register = int(parts[2], 16)
+                    data = [int(x, 16) for x in parts[3:]]
+                    result = i2c_server.i2c_write(address, register, data)
+                    response = "OK" if result is True else f"ERROR {result}"
+                
+                elif parts[0].lower() == "scan":
+                    devices = []
+                    for address in range(0x03, 0x77):
+                        try:
+                            self.bus.read_byte(address)
+                            devices.append(hex(address))
+                        except:
+                            pass
+                    response = f"OK {devices}"
+                
+                else:
+                    response = "ERROR: Unknown command or invalid parameters"
+            
+            except ValueError:
+                response = "ERROR: Invalid parameter format"
+            
             sslsock.sendall(response.encode())
-    except ssl.SSLError as e:
-        print(f"SSL error from {client_address}: {e}")
-    except socket.error as e:
-        print(f"Socket error from {client_address}: {e}")
+    
+    except (ssl.SSLError, socket.error) as e:
+        print(f"Connection error with {client_address}: {e}")
     except Exception as e:
-        print(f"An unexpected error occurred with {client_address}: {e}")
+        print(f"Unexpected error with {client_address}: {e}")
     finally:
         sslsock.close()
 
-def process_command(command):
-    """
-    Process the client command and return the appropriate response.
-    """
-    if command == "dump":
-        # Dump I2C data (example: read 16 bytes from I2C)
-        try:
-            data = i2c_bus.read_i2c_block_data(I2C_ADDRESS, 0, 16)
-            return f"DUMP: {data}"
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    elif command.startswith("i2c"):
-        # Example: i2c read <register> or i2c write <register> <value>
-        parts = command.split()
-        if len(parts) == 3 and parts[1] == "read":
-            try:
-                register = int(parts[2], 16)
-                value = i2c_bus.read_byte_data(I2C_ADDRESS, register)
-                return f"READ: Register {hex(register)} = {hex(value)}"
-            except Exception as e:
-                return f"ERROR: {e}"
-        elif len(parts) == 4 and parts[1] == "write":
-            try:
-                register = int(parts[2], 16)
-                value = int(parts[3], 16)
-                i2c_bus.write_byte_data(I2C_ADDRESS, register, value)
-                return f"WRITE: Register {hex(register)} set to {hex(value)}"
-            except Exception as e:
-                return f"ERROR: {e}"
-        else:
-            return "ERROR: Invalid I2C command format. Use 'i2c read <register>' or 'i2c write <register> <value>'."
-
-    elif command.startswith("set"):
-        # Example: set <register> <value>
-        parts = command.split()
-        if len(parts) == 3:
-            try:
-                register = int(parts[1], 16)
-                value = int(parts[2], 16)
-                i2c_bus.write_byte_data(I2C_ADDRESS, register, value)
-                return f"SET: Register {hex(register)} set to {hex(value)}"
-            except Exception as e:
-                return f"ERROR: {e}"
-        else:
-            return "ERROR: Invalid SET command format. Use 'set <register> <value>'."
-
-    else:
-        return "ERROR: Unknown command. Supported commands: dump, i2c read <register>, i2c write <register> <value>, set <register> <value>."
-
-def tls_server(server_address, server_port, certfile, keyfile):
+def tls_i2c_server(server_address, server_port, certfile, keyfile, bus_number=1):
     sock = None
     try:
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -91,18 +97,22 @@ def tls_server(server_address, server_port, certfile, keyfile):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind((server_address, server_port))
         sock.listen(5)
-        print(f"TLS Server listening on {server_address}:{server_port}")
+        
+        i2c_server = I2CServer(bus_number)
+        print(f"TLS I2C Server listening on {server_address}:{server_port}")
+        
         while True:
             client_sock, client_addr = sock.accept()
             try:
                 sslsock = context.wrap_socket(client_sock, server_side=True)
+                client_thread = threading.Thread(target=handle_client, 
+                                                args=(sslsock, client_addr, i2c_server))
+                client_thread.daemon = True
+                client_thread.start()
             except ssl.SSLError as e:
                 print(f"SSL handshake error with {client_addr}: {e}")
                 client_sock.close()
-                continue
-            client_thread = threading.Thread(target=handle_client, args=(sslsock, client_addr))
-            client_thread.daemon = True
-            client_thread.start()
+    
     except Exception as e:
         print(traceback.format_exc())
     finally:
@@ -110,8 +120,10 @@ def tls_server(server_address, server_port, certfile, keyfile):
             sock.close()
 
 if __name__ == "__main__":
-    server_address = "0.0.0.0"  # Listen on all interfaces
-    server_port = 12345
-    certfile = "keys/server.crt"
-    keyfile = "keys/server.key"
-    tls_server(server_address, server_port, certfile, keyfile)
+    SERVER_ADDRESS = "0.0.0.0"  # Listen on all interfaces
+    SERVER_PORT = 12345
+    CERTFILE = "keys/server.crt"
+    KEYFILE = "keys/server.key"
+    I2C_BUS = 1  # Typically 1 for Raspberry Pi 3/4
+    
+    tls_i2c_server(SERVER_ADDRESS, SERVER_PORT, CERTFILE, KEYFILE, I2C_BUS)
