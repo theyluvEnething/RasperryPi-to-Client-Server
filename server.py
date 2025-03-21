@@ -155,7 +155,7 @@ def tls_i2c_server(server_address, server_port, certfile, keyfile, bus_number=1)
             i2c_handler.close()
 
 if __name__ == "__main__":
-    SERVER_ADDRESS = "0.0.0.0"
+    SERVER_ADDRESS = "192.168.165.168"
     SERVER_PORT = 12345
     CERTFILE = "keys/server.crt"
     KEYFILE = "keys/server.key"
