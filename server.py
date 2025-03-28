@@ -377,38 +377,72 @@ def handle_client(sslsock, client_address, i2c_handler):
                                     if stop_cmd_raw:
                                         stop_cmd = stop_cmd_raw.decode().strip().lower()
                                         if stop_cmd == 'stop':
-                                            logging.info(f"Stopping gyro stream for {client_ip}:{client_port}")
-                                            sslsock.sendall(b"OK Gyro stream stopped.\n")
+                                            logging.info(f"Stopping gyro stream for {client_ip}:{client_port} via 'stop' command.")
+                                            try:
+                                                sslsock.sendall(b"OK Gyro stream stopped.\n")
+                                            except Exception as send_err:
+                                                logging.warning(f"Could not send 'stream stopped' confirmation: {send_err}")
                                             is_streaming_gyro = False # Exit streaming loop
-                                            # break # Break inner while loop
                                         else:
-                                            # Received something other than 'stop' - could log or ignore
-                                            logging.debug(f"Unexpected data during gyro stream: {stop_cmd}")
-                                            # We might need to buffer this if it's a valid command meant for later?
-                                            # For now, we consume and ignore it while streaming.
+                                            logging.debug(f"Ignoring unexpected data during gyro stream: {stop_cmd}")
+                                            # Note: If valid commands can be interleaved, this needs more complex handling.
 
                                 except socket.timeout:
                                     pass # No 'stop' command received, continue loop
+
+                                # --- **MODIFICATION HERE** ---
+                                # Specifically handle EOF/disconnect errors during the 'stop' check gracefully
+                                except ssl.SSLEOFError:
+                                    # Client closed the connection without saying 'stop' - expected with current client
+                                    logging.info(f"Client {client_ip}:{client_port} disconnected during gyro stream (EOF). Stopping stream.")
+                                    is_streaming_gyro = False # Stop streaming
+                                except socket.error as sock_check_err:
+                                    # Handle other potential socket errors during the check, e.g., ConnectionResetError
+                                    if sock_check_err.errno == 104: # Connection reset by peer
+                                        logging.info(f"Client {client_ip}:{client_port} reset connection during gyro stream. Stopping stream.")
+                                    else:
+                                        logging.error(f"Socket error during gyro stream 'stop' check: {sock_check_err}")
+                                    is_streaming_gyro = False # Stop streaming
+                                # --- End of Modification ---
+
+                                except Exception as recv_check_err:
+                                    # Catch any other unexpected errors during the check
+                                    logging.error(f"Unexpected error during gyro stream 'stop' check: {recv_check_err}")
+                                    is_streaming_gyro = False # Stop streaming
                                 finally:
-                                    sslsock.settimeout(default_sock_timeout) # Restore original timeout *after* checking
+                                    # Restore original timeout ONLY if we are continuing the stream
+                                    if is_streaming_gyro:
+                                        try:
+                                            sslsock.settimeout(default_sock_timeout)
+                                        except socket.error:
+                                             # Socket might already be dead if an error occurred above
+                                             is_streaming_gyro = False
+
 
                             except (I2CError, struct.error) as read_e:
                                 logging.error(f"Error reading/processing gyro data: {read_e}")
                                 try:
                                     sslsock.sendall(f"ERROR: Reading gyro data failed - {read_e}\n".encode())
-                                except: pass # Avoid error cascade if send fails
-                                is_streaming_gyro = False # Stop streaming on error
-                                # break # Break inner while loop
+                                except: pass
+                                is_streaming_gyro = False
                             except (socket.error, ssl.SSLError) as sock_e:
-                                logging.error(f"Socket error during gyro stream: {sock_e}")
-                                is_streaming_gyro = False # Stop streaming
-                                # break # Break inner while loop
+                                # This catches errors during the main sendall() of gyro data
+                                logging.error(f"Socket error during gyro stream send: {sock_e}")
+                                is_streaming_gyro = False
+                            except Exception as stream_loop_err:
+                                # Catch-all for other unexpected errors in the stream loop
+                                logging.error(f"Unexpected error in gyro stream loop: {stream_loop_err}")
+                                is_streaming_gyro = False
 
-                        # Exited the inner 'while is_streaming_gyro' loop
-                        logging.debug("Exited gyro stream loop.")
-                        # Reset timeout just in case it wasn't reset in the loop exit path
-                        sslsock.settimeout(default_sock_timeout)
-                        continue # Go back to the start of the outer while loop to wait for next command
+                        # --- End of 'while is_streaming_gyro' loop ---
+                        logging.debug(f"Exited gyro stream loop for {client_ip}:{client_port}.")
+                        # Ensure timeout is reset if loop exited abruptly
+                        try:
+                            sslsock.settimeout(default_sock_timeout)
+                        except socket.error: pass # Ignore if socket already closed
+
+                        # After stream ends (normally or via error), wait for next command
+                        continue
 
                     # --- UNKNOWN command ---
                     else:
