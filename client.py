@@ -2,6 +2,8 @@ import socket
 import ssl
 import sys
 import traceback
+import time
+import signal # Optional: For graceful exit if needed in specific scenarios
 
 # --- Configuration ---
 # !! Important: Replace with the actual IP address of your Raspberry Pi !!
@@ -26,24 +28,21 @@ def send_command(server_address, server_port, command_str):
     sslsock = None
     try:
         # 1. Create SSL Context (INSECURE - Disables Verification)
-        #    For production, use:
-        #    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile='path/to/server/ca.crt')
-        #    context.check_hostname = True
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT) # Specify TLS client protocol
-        context.check_hostname = False                    # Disable hostname verification (Insecure)
-        context.verify_mode = ssl.CERT_NONE               # Disable certificate verification (Insecure)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE # <<< INSECURE! For testing only.
 
         # 2. Create and Connect Socket
+        # print(f"Connecting to {server_address}:{server_port}...") # Verbose
         sock = socket.create_connection((server_address, server_port), timeout=CONNECTION_TIMEOUT)
 
         # 3. Wrap Socket with SSL/TLS
-        #    server_hostname is important for SNI (Server Name Indication) even if check_hostname is False
         sslsock = context.wrap_socket(sock, server_hostname=server_address)
-        print(f"Connected to {server_address}:{server_port} using {sslsock.version()}")
+        # print(f"Connected via {sslsock.version()}") # Verbose
 
         # 4. Send Command
         print(f"Sending: {command_str}")
-        sslsock.sendall(command_str.encode('utf-8')) # Use utf-8 explicitly
+        sslsock.sendall(command_str.encode('utf-8'))
 
         # 5. Receive Response
         sslsock.settimeout(RECEIVE_TIMEOUT)
@@ -51,19 +50,18 @@ def send_command(server_address, server_port, command_str):
         if not response_bytes:
             print("Server closed connection unexpectedly.")
             return None
-        response_str = response_bytes.decode('utf-8') # Use utf-8 explicitly
+        response_str = response_bytes.decode('utf-8')
         print(f"Received: {response_str}")
         return response_str
 
     except ssl.SSLCertVerificationError as e:
         print(f"SSL CERTIFICATE VERIFICATION ERROR: {e}", file=sys.stderr)
         print(" -> If using self-signed certs, ensure verify_mode=ssl.CERT_NONE (INSECURE) or", file=sys.stderr)
-        print(" -> provide the correct CA certificate using context.load_verify_locations()", file=sys.stderr)
+        print(" -> distribute the server's certificate or a CA cert and use context.load_verify_locations()", file=sys.stderr)
         return None
     except ssl.SSLError as e:
         print(f"SSL ERROR: {e}", file=sys.stderr)
         print(f" -> Check TLS/SSL protocol compatibility and certificate validity on server.", file=sys.stderr)
-        # traceback.print_exc() # Uncomment for detailed SSL traceback
         return None
     except socket.timeout:
         print(f"ERROR: Connection or receive timed out ({CONNECTION_TIMEOUT}/{RECEIVE_TIMEOUT}s)", file=sys.stderr)
@@ -82,16 +80,15 @@ def send_command(server_address, server_port, command_str):
             try:
                 sslsock.shutdown(socket.SHUT_RDWR)
             except (OSError, socket.error):
-                pass # Ignore errors if already closed
+                pass
             finally:
                 sslsock.close()
-            # print("Connection closed.") # Optional: uncomment for verbose closing message
         elif sock:
-            sock.close() # Close underlying socket if SSL wrap failed
+            sock.close()
 
 def print_menu():
     """Prints the command format menu."""
-    print("\n--- TLS I2C Client ---")
+    print("\n--- TLS I2C/GPIO Client ---")
     print("Enter command (case-insensitive) or 'exit'. Examples:")
     print("  scan")
     print("  read <addr_hex> <reg_hex> [length_dec=1]")
@@ -104,6 +101,9 @@ def print_menu():
     print("     e.g., rawwrite 0x20 DE AD")
     print("  dump <addr_hex> [length_dec=16]  (Alias for rawread)")
     print("     e.g., dump 0x50")
+    print("  led <on|off>") # <-- Added LED command example
+    print("     e.g., led on")
+    print("     e.g., led off")
     print("-----------------------")
 
 if __name__ == "__main__":
@@ -128,7 +128,7 @@ if __name__ == "__main__":
         print_menu()
         try:
             command = input("Enter command> ").strip()
-        except EOFError: # Handle Ctrl+D
+        except EOFError:
              print("\nExiting.")
              break
 
@@ -141,4 +141,4 @@ if __name__ == "__main__":
 
         # Send the raw command entered by the user
         send_command(server_address, server_port, command)
-        # The send_command function now prints the response directly
+        # The send_command function prints the response directly
