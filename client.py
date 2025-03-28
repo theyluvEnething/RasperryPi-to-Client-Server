@@ -3,7 +3,10 @@ import ssl
 import sys
 import traceback
 import time
-import signal # Optional: For graceful exit if needed in specific scenarios
+import tkinter as tk
+from tkinter import scrolledtext
+from tkinter import messagebox
+from tkinter import font as tkFont  # Import font module
 
 # --- Configuration ---
 # !! Important: Replace with the actual IP address of your Raspberry Pi !!
@@ -12,7 +15,8 @@ DEFAULT_SERVER_PORT = 12345
 CONNECTION_TIMEOUT = 5.0 # Seconds to wait for connection
 RECEIVE_TIMEOUT = 10.0   # Seconds to wait for response
 
-def send_command(server_address, server_port, command_str):
+# --- TLS Communication Logic ---
+def send_command(server_address, server_port, command_str, status_callback=None):
     """
     Connects to the TLS server, sends a command, and returns the response.
 
@@ -20,12 +24,20 @@ def send_command(server_address, server_port, command_str):
         server_address (str): The IP address or hostname of the server.
         server_port (int): The port number of the server.
         command_str (str): The command string to send.
+        status_callback (func): Optional function to call with status updates.
 
     Returns:
-        str: The decoded response from the server, or None if an error occurred.
+        str: The decoded response from the server, or an error string starting with "ERROR:".
     """
     sock = None
     sslsock = None
+
+    def update_status(message):
+        if status_callback:
+            status_callback(message)
+        else:
+            print(message) # Fallback for non-GUI use
+
     try:
         # 1. Create SSL Context (INSECURE - Disables Verification)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -33,47 +45,46 @@ def send_command(server_address, server_port, command_str):
         context.verify_mode = ssl.CERT_NONE # <<< INSECURE! For testing only.
 
         # 2. Create and Connect Socket
-        # print(f"Connecting to {server_address}:{server_port}...") # Verbose
+        update_status(f"Connecting to {server_address}:{server_port}...")
         sock = socket.create_connection((server_address, server_port), timeout=CONNECTION_TIMEOUT)
 
         # 3. Wrap Socket with SSL/TLS
         sslsock = context.wrap_socket(sock, server_hostname=server_address)
-        # print(f"Connected via {sslsock.version()}") # Verbose
+        update_status(f"Connected via {sslsock.version()}. Sending: {command_str}")
 
         # 4. Send Command
-        print(f"Sending: {command_str}")
         sslsock.sendall(command_str.encode('utf-8'))
 
         # 5. Receive Response
         sslsock.settimeout(RECEIVE_TIMEOUT)
         response_bytes = sslsock.recv(4096)
         if not response_bytes:
-            print("Server closed connection unexpectedly.")
-            return None
+            update_status("Server closed connection unexpectedly.")
+            return "ERROR: Server closed connection."
         response_str = response_bytes.decode('utf-8')
-        print(f"Received: {response_str}")
+        update_status(f"Received: {response_str}")
         return response_str
 
     except ssl.SSLCertVerificationError as e:
-        print(f"SSL CERTIFICATE VERIFICATION ERROR: {e}", file=sys.stderr)
-        print(" -> If using self-signed certs, ensure verify_mode=ssl.CERT_NONE (INSECURE) or", file=sys.stderr)
-        print(" -> distribute the server's certificate or a CA cert and use context.load_verify_locations()", file=sys.stderr)
-        return None
+        err_msg = f"ERROR: SSL CERTIFICATE VERIFICATION FAILED: {e}\n (Is server using a self-signed cert? This client uses CERT_NONE - INSECURE)"
+        update_status(err_msg)
+        return err_msg
     except ssl.SSLError as e:
-        print(f"SSL ERROR: {e}", file=sys.stderr)
-        print(f" -> Check TLS/SSL protocol compatibility and certificate validity on server.", file=sys.stderr)
-        return None
+        err_msg = f"ERROR: SSL ERROR: {e}\n (Check TLS/SSL versions and cert validity?)"
+        update_status(err_msg)
+        return err_msg
     except socket.timeout:
-        print(f"ERROR: Connection or receive timed out ({CONNECTION_TIMEOUT}/{RECEIVE_TIMEOUT}s)", file=sys.stderr)
-        return None
+        err_msg = f"ERROR: Connection or receive timed out ({CONNECTION_TIMEOUT}/{RECEIVE_TIMEOUT}s)"
+        update_status(err_msg)
+        return err_msg
     except socket.error as e:
-        print(f"SOCKET ERROR: {e}", file=sys.stderr)
-        print(f" -> Is the server running at {server_address}:{server_port}?", file=sys.stderr)
-        return None
+        err_msg = f"ERROR: SOCKET ERROR: {e}\n (Is the server running at {server_address}:{server_port}?)"
+        update_status(err_msg)
+        return err_msg
     except Exception as e:
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
-        traceback.print_exc()
-        return None
+        err_msg = f"ERROR: An unexpected error occurred: {e}\n{traceback.format_exc()}"
+        update_status(err_msg)
+        return err_msg
     finally:
         # 6. Close Connection
         if sslsock:
@@ -83,62 +94,147 @@ def send_command(server_address, server_port, command_str):
                 pass
             finally:
                 sslsock.close()
+                update_status("Connection closed.")
         elif sock:
             sock.close()
+            update_status("Connection closed (socket only).")
 
-def print_menu():
-    """Prints the command format menu."""
-    print("\n--- TLS I2C/GPIO Client ---")
-    print("Enter command (case-insensitive) or 'exit'. Examples:")
-    print("  scan")
-    print("  read <addr_hex> <reg_hex> [length_dec=1]")
-    print("     e.g., read 0x50 0x00 4")
-    print("  write <addr_hex> <reg_hex> <byte1_hex> [byte2_hex ...]")
-    print("     e.g., write 0x50 0x10 AA BB CC")
-    print("  rawread <addr_hex> <length_dec>")
-    print("     e.g., rawread 0x50 16")
-    print("  rawwrite <addr_hex> <byte1_hex> [byte2_hex ...]")
-    print("     e.g., rawwrite 0x20 DE AD")
-    print("  dump <addr_hex> [length_dec=16]  (Alias for rawread)")
-    print("     e.g., dump 0x50")
-    print("  led <on|off>") # <-- Added LED command example
-    print("     e.g., led on")
-    print("     e.g., led off")
-    print("-----------------------")
+# --- GUI Application Class ---
+class I2CGuiClient:
+    def __init__(self, master):
+        self.master = master
+        master.title("TLS I2C/GPIO Client")
 
-if __name__ == "__main__":
-    server_address = input(f"Enter Server IP Address [{DEFAULT_SERVER_ADDRESS}]: ").strip()
-    if not server_address:
-        server_address = DEFAULT_SERVER_ADDRESS
+        # Increase default font size
+        default_font = tkFont.nametofont("TkDefaultFont")
+        default_font.configure(size=11)
+        master.option_add("*Font", default_font)
 
-    port_str = input(f"Enter Server Port [{DEFAULT_SERVER_PORT}]: ").strip()
-    try:
-        server_port = int(port_str) if port_str else DEFAULT_SERVER_PORT
-    except ValueError:
-        print(f"Invalid port '{port_str}', using default {DEFAULT_SERVER_PORT}.")
-        server_port = DEFAULT_SERVER_PORT
+        # Frame for connection details
+        conn_frame = tk.Frame(master, padx=10, pady=5)
+        conn_frame.pack(fill=tk.X)
 
-    print("\n" + "*"*40)
-    print(" WARNING: SSL certificate verification is DISABLED.")
-    print("          Connection is encrypted but not authenticated.")
-    print("          DO NOT use in production without proper cert validation.")
-    print("*"*40 + "\n")
+        tk.Label(conn_frame, text="Server IP:").grid(row=0, column=0, sticky=tk.W, padx=2)
+        self.ip_entry = tk.Entry(conn_frame, width=15)
+        self.ip_entry.grid(row=0, column=1, padx=2)
+        self.ip_entry.insert(0, DEFAULT_SERVER_ADDRESS)
 
-    while True:
-        print_menu()
+        tk.Label(conn_frame, text="Port:").grid(row=0, column=2, sticky=tk.W, padx=2)
+        self.port_entry = tk.Entry(conn_frame, width=6)
+        self.port_entry.grid(row=0, column=3, padx=2)
+        self.port_entry.insert(0, str(DEFAULT_SERVER_PORT))
+
+        # Frame for common command buttons
+        button_frame = tk.Frame(master, padx=10, pady=5)
+        button_frame.pack(fill=tk.X)
+
+        self.led_on_button = tk.Button(button_frame, text="LED ON", command=self.send_led_on)
+        self.led_on_button.pack(side=tk.LEFT, padx=5)
+
+        self.led_off_button = tk.Button(button_frame, text="LED OFF", command=self.send_led_off)
+        self.led_off_button.pack(side=tk.LEFT, padx=5)
+
+        self.scan_button = tk.Button(button_frame, text="Scan I2C Bus", command=self.send_scan)
+        self.scan_button.pack(side=tk.LEFT, padx=5)
+
+        # Frame for custom command entry
+        custom_cmd_frame = tk.Frame(master, padx=10, pady=5)
+        custom_cmd_frame.pack(fill=tk.X)
+
+        tk.Label(custom_cmd_frame, text="Command:").pack(side=tk.LEFT, padx=2)
+        self.cmd_entry = tk.Entry(custom_cmd_frame)
+        self.cmd_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self.cmd_entry.bind("<Return>", self.send_custom_command_event) # Bind Enter key
+
+        self.send_button = tk.Button(custom_cmd_frame, text="Send", command=self.send_custom_command)
+        self.send_button.pack(side=tk.LEFT, padx=5)
+
+        # Frame for output/log
+        output_frame = tk.Frame(master, padx=10, pady=10)
+        output_frame.pack(expand=True, fill=tk.BOTH)
+
+        self.output_text = scrolledtext.ScrolledText(output_frame, wrap=tk.WORD, height=15, width=60)
+        self.output_text.pack(expand=True, fill=tk.BOTH)
+        self.output_text.configure(state='disabled') # Make read-only initially
+
+        # Initial Warning
+        self.log_message("*" * 40, tag="warning")
+        self.log_message(" WARNING: SSL certificate verification is DISABLED.", tag="warning")
+        self.log_message(" Connection is encrypted but not authenticated.", tag="warning")
+        self.log_message(" DO NOT use in production without proper cert validation.", tag="warning")
+        self.log_message("*" * 40, tag="warning")
+        self.output_text.tag_config("warning", foreground="red", font=(default_font.actual()['family'], default_font.actual()['size'], 'bold'))
+        self.output_text.tag_config("command", foreground="blue")
+        self.output_text.tag_config("response", foreground="darkgreen")
+        self.output_text.tag_config("error", foreground="red")
+        self.output_text.tag_config("status", foreground="grey")
+
+
+    def log_message(self, message, tag=None):
+        """Appends a message to the output text area."""
+        self.output_text.configure(state='normal') # Enable writing
+        self.output_text.insert(tk.END, message + '\n', tag)
+        self.output_text.configure(state='disabled') # Disable writing
+        self.output_text.see(tk.END) # Scroll to the end
+        self.master.update_idletasks() # Refresh GUI immediately
+
+    def update_status_for_send(self, message):
+        """Callback for send_command to log status messages."""
+        self.log_message(message, tag="status")
+
+    def execute_command(self, command):
+        """Gets connection details, sends command, and logs result."""
+        ip = self.ip_entry.get().strip()
+        port_str = self.port_entry.get().strip()
+
+        if not ip:
+            messagebox.showerror("Error", "Server IP address cannot be empty.")
+            return
         try:
-            command = input("Enter command> ").strip()
-        except EOFError:
-             print("\nExiting.")
-             break
+            port = int(port_str)
+            if not (0 < port < 65536):
+                raise ValueError("Port out of range")
+        except ValueError:
+            messagebox.showerror("Error", f"Invalid port number: {port_str}")
+            return
 
-        if not command:
-            continue
+        self.log_message(f"CMD> {command}", tag="command")
+        response = send_command(ip, port, command, self.update_status_for_send)
 
-        if command.lower() == "exit":
-            print("Exiting.")
-            break
+        if response:
+            if response.startswith("ERROR:"):
+                 self.log_message(f"RES< {response}", tag="error")
+            else:
+                 self.log_message(f"RES< {response}", tag="response")
+        else:
+            # send_command logs errors internally via callback, but handle None just in case
+             self.log_message("RES< No response received or error occurred.", tag="error")
 
-        # Send the raw command entered by the user
-        send_command(server_address, server_port, command)
-        # The send_command function prints the response directly
+
+    def send_led_on(self):
+        self.execute_command("turnonled")
+
+    def send_led_off(self):
+        self.execute_command("turnoffled")
+
+    def send_scan(self):
+        self.execute_command("scan")
+
+    def send_custom_command(self):
+        custom_cmd = self.cmd_entry.get().strip()
+        if custom_cmd:
+            self.execute_command(custom_cmd)
+            self.cmd_entry.delete(0, tk.END) # Clear entry after sending
+        else:
+            self.log_message("Status: No custom command entered.", tag="status")
+
+    def send_custom_command_event(self, event):
+        """Handles the Enter key press in the command entry."""
+        self.send_custom_command()
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = I2CGuiClient(root)
+    root.mainloop()
