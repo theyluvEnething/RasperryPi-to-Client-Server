@@ -1,174 +1,513 @@
 import socket
 import ssl
-import sys
+import threading
 import traceback
+import os
+import fcntl
+import logging
+import argparse
 import time
-import struct # Needed for converting bytes to integer
-import signal # Needed for graceful exit on Ctrl+C
+import sys
 
-# --- Configuration ---
-# !! Important: Ensure this is the actual IP address of your Raspberry Pi !!
-DEFAULT_SERVER_ADDRESS = "172.20.10.3" # Set to your Pi's IP
-DEFAULT_SERVER_PORT = 12345
-CONNECTION_TIMEOUT = 5.0 # Seconds to wait for connection
-RECEIVE_TIMEOUT = 10.0   # Seconds to wait for response
+# --- GPIO Import ---
+try:
+    import RPi.GPIO as GPIO
+except ImportError:
+    # Provide a dummy GPIO class if running on non-Pi for testing imports
+    # Real operation will fail later if GPIO isn't actually available.
+    print("WARNING: RPi.GPIO module not found. GPIO functionality will fail.", file=sys.stderr)
+    class DummyGPIO:
+        BCM = None
+        OUT = None
+        LOW = 0
+        HIGH = 1
+        def setmode(self, mode): pass
+        def setup(self, pin, mode, initial): pass
+        def output(self, pin, state): raise RuntimeError("RPi.GPIO not available")
+        def cleanup(self): pass
+        def setwarnings(self, flag): pass
+    GPIO = DummyGPIO()
 
-# --- I2C Target Configuration ---
-I2C_DEVICE_ADDRESS = 0x6a
-Z_AXIS_REGISTER_LSB = 0x2c # Assuming LSB register for Z-axis
-READ_LENGTH = 2            # Reading 2 bytes for a 16-bit value
-READ_INTERVAL_SECONDS = 0.1 # How often to read (e.g., 0.1 = 10 Hz)
 
-# --- Global flag for loop control ---
-running = True
+# I2C constants - Standard Linux ioctl numbers
+I2C_SLAVE = 0x0703
+I2C_SLAVE_FORCE = 0x0706
+I2C_RDWR = 0x0707
+I2C_M_RD = 0x0001
 
-def signal_handler(sig, frame):
-    """Handles Ctrl+C signal for graceful shutdown."""
-    global running
-    print("\nCtrl+C detected. Stopping reads and disconnecting...")
-    running = False
+# Setup basic logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s')
 
-def connect_and_read_continuously(server_address, server_port):
-    """
-    Connects to the TLS server and continuously reads Z-axis acceleration.
-    """
-    global running
-    sslsock = None
-    sock = None
+class I2CError(IOError):
+    """Custom exception for I2C specific errors."""
+    pass
 
-    # Construct the command string once
-    # Format: read <addr_hex> <reg_hex> <length_dec>
-    command_str = f"read {I2C_DEVICE_ADDRESS:#04x} {Z_AXIS_REGISTER_LSB:#04x} {READ_LENGTH}"
-    # {:#04x} formats as "0xNN"
+class GPIOError(RuntimeError):
+    """Custom exception for GPIO specific errors."""
+    pass
+
+# --- I2CHandler Class (Unchanged from previous version) ---
+class I2CHandler:
+    def __init__(self, bus_number=1):
+        self.bus_number = bus_number
+        self.device_path = f"/dev/i2c-{self.bus_number}"
+        self.fd = None
+        self._lock = threading.Lock() # Lock for thread safety
+        self.open()
+
+    def open(self):
+        self.close()
+        logging.info(f"Opening I2C bus: {self.device_path}")
+        try:
+            self.fd = os.open(self.device_path, os.O_RDWR | os.O_CLOEXEC)
+        except OSError as e:
+            logging.error(f"Could not open I2C bus {self.device_path}: {e}")
+            raise I2CError(f"Could not open I2C bus {self.device_path}: {e}") from e
+        except Exception as e:
+             logging.error(f"Unexpected error opening I2C bus {self.device_path}: {e}")
+             raise I2CError(f"Unexpected error opening I2C bus {self.device_path}: {e}") from e
+
+    def close(self):
+        with self._lock:
+            if self.fd is not None:
+                logging.info(f"Closing I2C bus: {self.device_path}")
+                try:
+                    os.close(self.fd)
+                except OSError as e:
+                    logging.error(f"Error closing I2C file descriptor {self.fd}: {e}")
+                finally:
+                     self.fd = None
+
+    def _set_address(self, address):
+        if self.fd is None:
+            raise I2CError("I2C bus not open")
+        try:
+            fcntl.ioctl(self.fd, I2C_SLAVE, address)
+        except OSError as e:
+            logging.warning(f"ioctl(I2C_SLAVE, 0x{address:02X}) failed: {e}. Trying I2C_SLAVE_FORCE.")
+            try:
+                fcntl.ioctl(self.fd, I2C_SLAVE_FORCE, address)
+            except OSError as e_force:
+                logging.error(f"ioctl(I2C_SLAVE_FORCE, 0x{address:02X}) failed: {e_force}")
+                raise I2CError(f"Failed to set I2C slave address to 0x{address:02X}: {e_force}") from e_force
+
+    def read_bytes(self, address, length):
+        if length <= 0: return b''
+        with self._lock:
+            self._set_address(address)
+            try:
+                return os.read(self.fd, length)
+            except OSError as e:
+                logging.error(f"Failed to read {length} bytes from 0x{address:02X}: {e}")
+                raise I2CError(f"Failed to read from 0x{address:02X}: {e}") from e
+
+    def write_bytes(self, address, data):
+        if not data: return
+        with self._lock:
+            self._set_address(address)
+            try:
+                write_data = bytes(data)
+                bytes_written = os.write(self.fd, write_data)
+                if bytes_written != len(write_data):
+                     raise I2CError(f"Partial write to 0x{address:02X}: wrote {bytes_written}/{len(write_data)} bytes")
+            except OSError as e:
+                logging.error(f"Failed to write {len(data)} bytes to 0x{address:02X}: {e}")
+                raise I2CError(f"Failed to write to 0x{address:02X}: {e}") from e
+
+    def read_register(self, address, register, length=1):
+        if length <= 0: return b''
+        with self._lock:
+            self._set_address(address)
+            try:
+                reg_bytes = bytes([register])
+                bytes_written = os.write(self.fd, reg_bytes)
+                if bytes_written != 1:
+                     raise I2CError(f"Partial write for register address 0x{register:02X} on device 0x{address:02X}")
+                read_data = os.read(self.fd, length)
+                if len(read_data) != length:
+                     logging.warning(f"Short read from 0x{address:02X}, register 0x{register:02X}. Expected {length}, got {len(read_data)}")
+                return read_data
+            except OSError as e:
+                logging.error(f"Failed read from 0x{address:02X}, register 0x{register:02X}: {e}")
+                raise I2CError(f"Failed read from 0x{address:02X}, register 0x{register:02X}: {e}") from e
+
+    def write_register(self, address, register, data):
+        with self._lock:
+            self._set_address(address)
+            try:
+                write_data = bytes([register] + data)
+                bytes_written = os.write(self.fd, write_data)
+                if bytes_written != len(write_data):
+                    raise I2CError(f"Partial write to 0x{address:02X}, register 0x{register:02X}: wrote {bytes_written}/{len(write_data)} bytes")
+            except OSError as e:
+                logging.error(f"Failed write to 0x{address:02X}, register 0x{register:02X}: {e}")
+                raise I2CError(f"Failed write to 0x{address:02X}, register 0x{register:02X}: {e}") from e
+
+    def scan_devices(self):
+        devices = []
+        for addr in range(0x03, 0x78):
+            with self._lock:
+                if self.fd is None: raise I2CError("I2C bus not open for scanning")
+                try:
+                    fcntl.ioctl(self.fd, I2C_SLAVE, addr)
+                    try:
+                        os.read(self.fd, 1)
+                        devices.append(f"0x{addr:02x}")
+                    except OSError as read_err:
+                        if read_err.errno == 121: # Remote I/O error often means ACK but read fail
+                             devices.append(f"0x{addr:02x}")
+                             logging.debug(f"Device 0x{addr:02x} ACKed address but NACKed read (errno {read_err.errno}).")
+                        else:
+                             logging.debug(f"Read attempt failed for 0x{addr:02x}: {read_err}")
+                             pass
+                except OSError as e:
+                    logging.debug(f"No device found at 0x{addr:02x}: {e}")
+                    pass
+        return devices
+
+# --- NEW: GPIOHandler Class ---
+class GPIOHandler:
+    def __init__(self, led_pin):
+        if led_pin is None:
+            logging.warning("No LED pin specified, GPIO control disabled.")
+            self.led_pin = None
+            self.is_setup = False
+            return
+
+        self.led_pin = led_pin
+        self.is_setup = False
+        # Use BCM numbering (GPIOxx number)
+        GPIO.setmode(GPIO.BCM)
+        # Disable warnings like "This channel is already in use"
+        GPIO.setwarnings(False)
+        logging.info(f"GPIO mode set to BCM. LED pin configured as {self.led_pin}")
+
+    def setup(self):
+        """Sets up the GPIO pin for output."""
+        if not self.led_pin:
+            return # Do nothing if no pin is configured
+        try:
+            # Set the pin as output and initialize it to LOW (off)
+            GPIO.setup(self.led_pin, GPIO.OUT, initial=GPIO.LOW)
+            self.is_setup = True
+            logging.info(f"GPIO pin {self.led_pin} set up as OUTPUT, initial state LOW.")
+        except Exception as e:
+            # Catch potential RuntimeErrors from RPi.GPIO or others
+            logging.error(f"Failed to setup GPIO pin {self.led_pin}: {e}")
+            self.is_setup = False
+            raise GPIOError(f"Failed to setup GPIO pin {self.led_pin}: {e}") from e
+
+    def led_on(self):
+        """Turns the LED ON (sets pin HIGH)."""
+        if not self.is_setup:
+            raise GPIOError("GPIO pin not set up or setup failed.")
+        try:
+            GPIO.output(self.led_pin, GPIO.HIGH)
+            logging.debug(f"Set GPIO pin {self.led_pin} HIGH (LED ON)")
+        except Exception as e:
+            logging.error(f"Failed to set GPIO pin {self.led_pin} HIGH: {e}")
+            raise GPIOError(f"Failed to set GPIO pin {self.led_pin} HIGH: {e}") from e
+
+    def led_off(self):
+        """Turns the LED OFF (sets pin LOW)."""
+        if not self.is_setup:
+            raise GPIOError("GPIO pin not set up or setup failed.")
+        try:
+            GPIO.output(self.led_pin, GPIO.LOW)
+            logging.debug(f"Set GPIO pin {self.led_pin} LOW (LED OFF)")
+        except Exception as e:
+            logging.error(f"Failed to set GPIO pin {self.led_pin} LOW: {e}")
+            raise GPIOError(f"Failed to set GPIO pin {self.led_pin} LOW: {e}") from e
+
+    def cleanup(self):
+        """Cleans up GPIO resources."""
+        if self.is_setup:
+            logging.info(f"Cleaning up GPIO pin {self.led_pin}")
+            try:
+                # Optional: Set LED off before cleanup
+                # self.led_off()
+                GPIO.cleanup(self.led_pin) # Clean up only the pin we used
+                self.is_setup = False
+            except Exception as e:
+                 logging.error(f"Error during GPIO cleanup for pin {self.led_pin}: {e}")
+        # else:
+             # logging.info("GPIO cleanup skipped (pin was not setup or configured).")
+
+
+# --- Modified handle_client Function ---
+def handle_client(sslsock, client_address, i2c_handler, gpio_handler): # Added gpio_handler
+    """Handles communication with a single TLS client."""
+    client_ip, client_port = client_address
+    logging.info(f"Client connected: {client_ip}:{client_port}")
+    try:
+        while True:
+            sslsock.settimeout(300.0)
+            try:
+                data_raw = sslsock.recv(4096)
+                if not data_raw:
+                    logging.info(f"Client {client_ip}:{client_port} disconnected gracefully.")
+                    break
+                data = data_raw.decode().strip()
+            except socket.timeout:
+                 logging.warning(f"Client {client_ip}:{client_port} timed out.")
+                 break
+            except UnicodeDecodeError:
+                 logging.warning(f"Client {client_ip}:{client_port} sent non-UTF8 data.")
+                 sslsock.sendall(b"ERROR: Invalid encoding. Use UTF-8.")
+                 continue
+
+            logging.debug(f"Received command from {client_ip}:{client_port}: {data}")
+            parts = data.split()
+            if not parts:
+                continue
+
+            command = parts[0].lower()
+            response = "ERROR: Invalid command format"
+
+            try:
+                # --- SCAN command ---
+                if command == "scan" and len(parts) == 1:
+                    devices = i2c_handler.scan_devices()
+                    response = f"OK {' '.join(devices)}"
+
+                # --- READ REGISTER command ---
+                elif command == "read" and len(parts) >= 3:
+                    addr = int(parts[1], 16)
+                    reg = int(parts[2], 16)
+                    length = int(parts[3]) if len(parts) > 3 else 1
+                    if length <= 0 or length > 255: raise ValueError("Length must be between 1 and 255")
+                    result_bytes = i2c_handler.read_register(addr, reg, length)
+                    response = f"OK {result_bytes.hex(' ')}"
+
+                # --- WRITE REGISTER command ---
+                elif command == "write" and len(parts) >= 4:
+                    addr = int(parts[1], 16)
+                    reg = int(parts[2], 16)
+                    data_to_write = [int(x, 16) for x in parts[3:]]
+                    if not data_to_write: raise ValueError("No data bytes provided for write")
+                    i2c_handler.write_register(addr, reg, data_to_write)
+                    response = "OK"
+
+                # --- RAW READ BYTES command ---
+                elif command == "rawread" and len(parts) == 3:
+                    addr = int(parts[1], 16)
+                    length = int(parts[2])
+                    if length <= 0 or length > 255: raise ValueError("Length must be between 1 and 255")
+                    result_bytes = i2c_handler.read_bytes(addr, length)
+                    response = f"OK {result_bytes.hex(' ')}"
+
+                # --- RAW WRITE BYTES command ---
+                elif command == "rawwrite" and len(parts) >= 3:
+                    addr = int(parts[1], 16)
+                    data_to_write = [int(x, 16) for x in parts[2:]]
+                    if not data_to_write: raise ValueError("No data bytes provided for raw write")
+                    i2c_handler.write_bytes(addr, data_to_write)
+                    response = "OK"
+
+                # --- DUMP command ---
+                elif command == "dump" and len(parts) >= 2:
+                    addr = int(parts[1], 16)
+                    length = int(parts[2]) if len(parts) > 2 else 16
+                    if length <= 0 or length > 255: raise ValueError("Length must be between 1 and 255")
+                    result_bytes = i2c_handler.read_bytes(addr, length)
+                    response = f"OK {result_bytes.hex(' ')}"
+
+                # --- NEW: LED Control Command ---
+                elif command == "led" and len(parts) == 2:
+                    if not gpio_handler or not gpio_handler.is_setup:
+                         response = "ERROR: LED control not configured or setup failed on server"
+                    else:
+                         sub_command = parts[1].lower()
+                         if sub_command == "on":
+                             gpio_handler.led_on()
+                             response = "OK LED turned ON"
+                         elif sub_command == "off":
+                             gpio_handler.led_off()
+                             response = "OK LED turned OFF"
+                         else:
+                             response = f"ERROR: Unknown LED command '{parts[1]}'. Use 'on' or 'off'."
+
+                # --- UNKNOWN command ---
+                else:
+                    response = f"ERROR: Unknown command or incorrect parameters: '{data}'"
+
+            # --- Error Handling for Command Execution ---
+            except (ValueError, IndexError) as e:
+                response = f"ERROR: Invalid parameters - {e}"
+                logging.warning(f"Invalid parameters from {client_ip}:{client_port} for command '{data}': {e}")
+            except I2CError as e:
+                response = f"ERROR: I2C operation failed - {e}"
+                logging.error(f"I2C Error handling command '{data}' from {client_ip}:{client_port}: {e}")
+            except GPIOError as e: # Catch GPIO specific errors
+                 response = f"ERROR: GPIO operation failed - {e}"
+                 logging.error(f"GPIO Error handling command '{data}' from {client_ip}:{client_port}: {e}")
+            except Exception as e:
+                response = f"ERROR: Unexpected server error - {e}"
+                logging.error(f"Unexpected error handling command '{data}' from {client_ip}:{client_port}: {traceback.format_exc()}")
+
+            # --- Send Response ---
+            try:
+                logging.debug(f"Sending response to {client_ip}:{client_port}: {response}")
+                sslsock.sendall(response.encode())
+            except (socket.error, ssl.SSLError) as e:
+                 logging.error(f"Failed to send response to {client_ip}:{client_port}: {e}")
+                 break
+
+    # --- Error Handling for Connection ---
+    except (ssl.SSLError, socket.error) as e:
+        if isinstance(e, ssl.SSLError) and 'CERTIFICATE_UNKNOWN' in str(e):
+             logging.warning(f"Client {client_ip}:{client_port} disconnected possibly due to certificate issue: {e}")
+        elif isinstance(e, socket.error) and e.errno == 104: # Connection reset by peer
+             logging.info(f"Client {client_ip}:{client_port} reset the connection.")
+        else:
+             logging.error(f"Connection error with {client_ip}:{client_port}: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error in client handler for {client_ip}:{client_port}: {traceback.format_exc()}")
+    finally:
+        logging.info(f"Closing connection for {client_ip}:{client_port}")
+        try:
+            sslsock.shutdown(socket.SHUT_RDWR)
+        except (socket.error, OSError): pass
+        finally: sslsock.close()
+
+# --- Modified tls_i2c_server Function ---
+def tls_i2c_server(server_address, server_port, certfile, keyfile, bus_number=1, led_pin=None): # Added led_pin
+    """Starts the TLS secured I2C and GPIO server."""
+    server_sock = None
+    i2c_handler = None
+    gpio_handler = None # Initialize GPIO handler variable
+
+    if not os.path.exists(certfile):
+        logging.error(f"Certificate file not found: {certfile}")
+        return
+    if not os.path.exists(keyfile):
+        logging.error(f"Key file not found: {keyfile}")
+        return
 
     try:
-        # 1. Create SSL Context (INSECURE - Disables Verification)
-        print("Creating SSL context (WARNING: Certificate verification disabled)")
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        # --- Setup I2C Handler ---
+        i2c_handler = I2CHandler(bus_number)
 
-        # 2. Create and Connect Socket
-        print(f"Attempting to connect to {server_address}:{server_port}...")
-        sock = socket.create_connection((server_address, server_port), timeout=CONNECTION_TIMEOUT)
+        # --- Setup GPIO Handler ---
+        # Do this *after* I2C handler to ensure basic server setup is possible
+        # but *before* starting the server loop
+        gpio_handler = GPIOHandler(led_pin)
+        if led_pin is not None: # Only setup if a pin was provided
+            gpio_handler.setup() # Setup the pin
 
-        # 3. Wrap Socket with SSL/TLS
-        sslsock = context.wrap_socket(sock, server_hostname=server_address)
-        print(f"Connected successfully using {sslsock.version()}")
-        sslsock.settimeout(RECEIVE_TIMEOUT) # Set timeout for subsequent operations
+        # --- Setup SSL Context ---
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
 
-        # 4. Continuous Reading Loop
-        print(f"Starting continuous read from Dev:{I2C_DEVICE_ADDRESS:#04x} Reg:{Z_AXIS_REGISTER_LSB:#04x}...")
-        while running:
+        # --- Setup Server Socket ---
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((server_address, server_port))
+        server_sock.listen(5)
+        logging.info(f"TLS I2C/GPIO Server listening on {server_address}:{server_port}")
+        logging.info(f"  I2C Bus: {bus_number}")
+        if gpio_handler and gpio_handler.led_pin is not None:
+             logging.info(f"  GPIO LED Pin: {gpio_handler.led_pin} (BCM Mode)")
+        else:
+             logging.info("  GPIO LED Control: Disabled")
+        logging.info(f"  Using cert: {certfile}, key: {keyfile}")
+
+
+        # --- Accept Connections Loop ---
+        while True:
             try:
-                # --- Send Read Command ---
-                # print(f"Sending: {command_str}") # Uncomment for verbose debug
-                sslsock.sendall(command_str.encode('utf-8'))
+                client_sock, client_addr = server_sock.accept()
+                try:
+                    sslsock = context.wrap_socket(client_sock, server_side=True)
+                    client_thread = threading.Thread(
+                        target=handle_client,
+                        # Pass both handlers to the client thread
+                        args=(sslsock, client_addr, i2c_handler, gpio_handler),
+                        name=f"Client-{client_addr[0]}:{client_addr[1]}"
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                except ssl.SSLError as e:
+                    logging.error(f"SSL Handshake failed with {client_addr}: {e}")
+                    client_sock.close()
+                except Exception as e:
+                     logging.error(f"Failed to start handler thread for {client_addr}: {e}")
+                     client_sock.close()
 
-                # --- Receive Response ---
-                response_bytes = sslsock.recv(4096)
-                if not response_bytes:
-                    print("Server closed connection unexpectedly.")
-                    running = False # Stop the loop
-                    break
-                response_str = response_bytes.decode('utf-8').strip()
-                # print(f"Received: {response_str}") # Uncomment for verbose debug
+            except KeyboardInterrupt:
+                 logging.info("Shutdown signal received (KeyboardInterrupt).")
+                 break
+            except Exception as e:
+                 logging.error(f"Error accepting connection: {e}")
+                 time.sleep(0.1)
 
-                # --- Parse and Process Response ---
-                if response_str.startswith("OK "):
-                    hex_values = response_str[3:].split() # Get space-separated hex strings
-                    if len(hex_values) == READ_LENGTH:
-                        try:
-                            byte_list = [int(h, 16) for h in hex_values]
-                            # Assuming Little-Endian ('<') signed short ('h')
-                            # bytes() constructor expects an iterable of ints 0-255
-                            z_accel_raw = struct.unpack('<h', bytes(byte_list))[0]
-                            # --- Print the result ---
-                            # Use \r for carriage return to overwrite the line
-                            print(f"Z Acceleration: {z_accel_raw}    \r", end='')
 
-                        except (ValueError, struct.error) as parse_err:
-                            print(f"\nError parsing/unpacking response data '{response_str[3:]}': {parse_err}")
-                        except Exception as proc_err:
-                             print(f"\nError processing data: {proc_err}")
-                    else:
-                        print(f"\nError: Received unexpected number of bytes. Expected {READ_LENGTH}, Got {len(hex_values)}: {response_str}")
-                elif response_str.startswith("ERROR"):
-                    print(f"\nServer returned error: {response_str}")
-                    # Decide if error is fatal or if we should retry
-                    # For now, we'll keep trying after a delay
-                else:
-                     print(f"\nReceived unexpected response format: {response_str}")
-
-                # --- Wait before next read ---
-                if running: # Check again in case Ctrl+C was pressed during processing
-                    time.sleep(READ_INTERVAL_SECONDS)
-
-            except socket.timeout:
-                print("\nERROR: Receive timed out. Retrying...")
-                # Optional: Add logic to reconnect if timeout persists
-                time.sleep(1) # Wait a bit before retrying
-                continue # Retry sending command
-            except (socket.error, ssl.SSLError) as loop_err:
-                print(f"\nSOCKET/SSL ERROR during loop: {loop_err}. Disconnecting.")
-                running = False # Stop the loop
-                break
-            except Exception as loop_exc:
-                print(f"\nUnexpected error during loop: {loop_exc}")
-                traceback.print_exc()
-                running = False # Stop the loop on unexpected errors
-                break
-
-    # --- Handle Connection Errors ---
-    except ssl.SSLCertVerificationError as e:
-        print(f"SSL CERTIFICATE VERIFICATION ERROR: {e}", file=sys.stderr)
+    except (I2CError, GPIOError) as e: # Catch setup errors for I2C or GPIO
+         logging.critical(f"Failed to initialize handlers: {e} - Server cannot start.")
     except ssl.SSLError as e:
-        print(f"SSL ERROR: {e}", file=sys.stderr)
-    except socket.timeout:
-        print(f"ERROR: Connection timed out ({CONNECTION_TIMEOUT}s)", file=sys.stderr)
+         logging.critical(f"SSL configuration error: {e} - Server cannot start.")
     except socket.error as e:
-        print(f"SOCKET ERROR during connection: {e}", file=sys.stderr)
-        print(f" -> Is the server running at {server_address}:{server_port}?", file=sys.stderr)
+         logging.critical(f"Socket error during setup: {e} - Server cannot start.")
     except Exception as e:
-        print(f"An unexpected error occurred during setup: {e}", file=sys.stderr)
-        traceback.print_exc()
-
-    # --- Cleanup ---
+        logging.critical(f"Fatal server error: {traceback.format_exc()}")
     finally:
-        if sslsock:
-            print("\nClosing connection...")
+        # --- Cleanup ---
+        logging.info("Shutting down server...")
+        if server_sock:
             try:
-                sslsock.shutdown(socket.SHUT_RDWR)
-            except (OSError, socket.error):
-                pass # Ignore errors if already closed
-            finally:
-                sslsock.close()
-            print("Connection closed.")
-        elif sock:
-            sock.close() # Close underlying socket if SSL wrap failed
+                 server_sock.close()
+                 logging.info("Server socket closed.")
+            except Exception as e:
+                 logging.error(f"Error closing server socket: {e}")
+        if i2c_handler:
+            try:
+                 i2c_handler.close()
+                 logging.info("I2C handler closed.")
+            except Exception as e:
+                 logging.error(f"Error closing I2C handler: {e}")
+        if gpio_handler: # Check if gpio_handler was successfully created
+            try:
+                 gpio_handler.cleanup() # Cleanup GPIO resources
+                 logging.info("GPIO handler cleaned up.")
+            except Exception as e:
+                 logging.error(f"Error cleaning up GPIO handler: {e}")
+        logging.info("Server shut down complete.")
 
 
 if __name__ == "__main__":
-    # Register the signal handler for Ctrl+C
-    signal.signal(signal.SIGINT, signal_handler)
+    parser = argparse.ArgumentParser(description="TLS-secured I2C and GPIO Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host address to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=12345, help="Port to listen on (default: 12345)")
+    parser.add_argument("--cert", default="keys/server.crt", help="Path to SSL certificate file (PEM format)")
+    parser.add_argument("--key", default="keys/server.key", help="Path to SSL private key file (PEM format)")
+    parser.add_argument("--bus", type=int, default=1, help="I2C bus number (default: 1 for RPi)")
+    # --- New Argument for LED Pin ---
+    parser.add_argument("--led-pin", type=int, default=17, help="BCM GPIO pin number for the LED (default: 17). Set to -1 to disable.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
-    server_address = input(f"Enter Server IP Address [{DEFAULT_SERVER_ADDRESS}]: ").strip()
-    if not server_address:
-        server_address = DEFAULT_SERVER_ADDRESS
+    args = parser.parse_args()
 
-    port_str = input(f"Enter Server Port [{DEFAULT_SERVER_PORT}]: ").strip()
-    try:
-        server_port = int(port_str) if port_str else DEFAULT_SERVER_PORT
-    except ValueError:
-        print(f"Invalid port '{port_str}', using default {DEFAULT_SERVER_PORT}.")
-        server_port = DEFAULT_SERVER_PORT
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    print("\n" + "*"*40)
-    print(" WARNING: SSL certificate verification is DISABLED.")
-    print("          Connection is encrypted but not authenticated.")
-    print("          DO NOT use in production without proper cert validation.")
-    print("*"*40 + "\n")
+    # Handle disabling LED pin
+    led_pin_to_use = args.led_pin if args.led_pin >= 0 else None
 
-    connect_and_read_continuously(server_address, server_port)
+    key_dir = os.path.dirname(args.cert)
+    # (Key generation check remains the same as before)
+    if key_dir and not os.path.exists(key_dir):
+        try:
+            os.makedirs(key_dir)
+            logging.info(f"Created directory: {key_dir}")
+            if not (os.path.exists(args.cert) and os.path.exists(args.key)):
+                 print(f"NOTE: Certificate ({args.cert}) and key ({args.key}) not found.")
+                 print("You need to generate them, e.g., using openssl:")
+                 print(f"  openssl req -x509 -newkey rsa:4096 -keyout {args.key} -out {args.cert} -sha256 -days 365 -nodes -subj '/CN=MyI2CServer'")
+                 exit(1)
+        except OSError as e:
+            logging.error(f"Failed to create directory {key_dir}: {e}")
+            # Continue, start will fail if files are missing
 
-    print("Client finished.")
+    # Pass the led_pin_to_use to the server function
+    tls_i2c_server(args.host, args.port, args.cert, args.key, args.bus, led_pin_to_use)
